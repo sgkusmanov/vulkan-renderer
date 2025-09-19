@@ -1,0 +1,81 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+layout(local_size_x = 32) in; // workgroup/block size, i.e. 64 threads
+layout(max_vertices = 64, max_primitives = 42) out; // 128 indices -> 42 triangles max
+layout(triangles) out;
+
+layout(set = 0, binding = 0) uniform UniformBufferObject {
+    mat4 model;
+    mat4 view;
+    mat4 proj;
+} ubo;
+
+struct Vertex {
+    float vx, vy, vz;
+    uint8_t nx, ny, nz, nw;
+    float tu, tv;
+};
+
+layout(set = 1, binding = 0) readonly buffer Vertices {
+    Vertex vertices[];
+};
+
+struct Meshlet {
+    uint32_t vertices[64]; // local vertices/indices ([0, 63]) into global vertices
+    uint8_t indices[128]; // local indices ([0, 127]) into local vertices
+    uint8_t indexCount;
+    uint8_t vertexCount;
+};
+
+layout(set = 1, binding = 1) readonly buffer Meshlets {
+    Meshlet meshlets[];
+};
+
+layout(location = 0) out vec3 fragNormal[];
+layout(location = 1) out vec2 fragTexCoord[];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x; // 0-63
+    uint meshletIndex = gl_WorkGroupID.x;
+    
+    if (meshletIndex >= meshlets.length()) return;
+    
+    Meshlet meshlet = meshlets[meshletIndex];
+    uint numTrianglesPerMeshlet = meshlet.indexCount / 3;
+    uint numVerticesPerMeshlet = meshlet.vertexCount;
+    
+    // load all vertices that this meshlet needs
+    for (uint i=tid; i<numVerticesPerMeshlet; i+=32) {
+    // if (tid < numVerticesPerMeshlet) {
+        uint globalVertexIndex = meshlet.vertices[i];
+        
+        if (globalVertexIndex < vertices.length()) {
+            Vertex v = vertices[globalVertexIndex];
+            vec3 pos = vec3(v.vx, v.vy, v.vz);
+            vec3 normal = vec3(v.nx, v.ny, v.nz) / 255.0 * 2.0 - 1.0;
+            
+            // write the vertices that this workgroup is going to render
+            gl_MeshVerticesEXT[i].gl_Position = ubo.proj * ubo.view * ubo.model * vec4(pos, 1.0);
+            fragNormal[i] = normal;
+            fragTexCoord[i] = vec2(v.tu, v.tv);
+        }
+    }
+    
+    // load the triangle
+    for (uint i=tid; i<numTrianglesPerMeshlet; i+=32) {
+    // if (tid < numTrianglesPerMeshlet) {
+        uint8_t localI0 = meshlet.indices[i * 3 + 0];
+        uint8_t localI1 = meshlet.indices[i * 3 + 1];
+        uint8_t localI2 = meshlet.indices[i * 3 + 2];
+        // refer to vertices defined in gl_MeshVerticesEXT
+        gl_PrimitiveTriangleIndicesEXT[i] = uvec3(localI0, localI1, localI2);
+    }
+    
+    // Set the actual output counts
+    if (tid == 0) {
+        SetMeshOutputsEXT(numVerticesPerMeshlet, numTrianglesPerMeshlet);
+    }
+}
